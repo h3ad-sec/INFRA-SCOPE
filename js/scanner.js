@@ -3,10 +3,20 @@
 let scanAborted = false;
 let currentAbortController = null;
 
-const SCAN_PANEL_IDS = ['overview-panel', 'whois-panel', 'livedns-panel', 'email-panel', 'asn-panel', 'certs-panel', 'subdomains-panel'];
-const SCAN_LOADING_BODY_IDS = ['whois-body', 'livedns-body', 'email-body', 'asn-body', 'certs-body', 'subdomains-body'];
-const SCAN_TOTAL_STEPS = 7;
+const SCAN_PANEL_IDS = [
+  'overview-panel', 'whois-panel', 'livedns-panel', 'email-panel', 'asn-panel', 'certs-panel', 'subdomains-panel',
+  'ti-panel', 'pdns-panel', 'cohosted-panel', 'ports-panel', 'fp-panel', 'cloud-panel', 'cdnwaf-panel', 'urlscan-panel', 'lookalike-panel',
+];
+const SCAN_LOADING_BODY_IDS = [
+  'whois-body', 'livedns-body', 'email-body', 'asn-body', 'certs-body', 'subdomains-body',
+  'ti-body', 'pdns-body', 'cohosted-body', 'ports-body', 'fp-body', 'cloud-body', 'cdnwaf-body', 'urlscan-body', 'lookalike-body',
+];
+const SCAN_TOTAL_STEPS = 16;
 const DKIM_SELECTORS = ['default', 'google', 'selector1', 'selector2', 'k1', 'k2', 'dkim', 'mail', 'smtp'];
+const HOMOGLYPH_MAP = { o: '0', l: '1', i: '1', e: '3', s: '5', a: '4' };
+const LOOKALIKE_TLD_SWAP_SET = ['com', 'net', 'org', 'co', 'io'];
+const LOOKALIKE_CAP = 70;
+const LOOKALIKE_BATCH = 8;
 
 function ipv4ToPtrName(ip) {
   if (!ip || ip.indexOf(':') !== -1) return null; // IPv6, unsupported here
@@ -62,6 +72,15 @@ async function runScan(target, type) {
     dmarc: null, dkim: [],
     crt: undefined, hackertarget: [], subdomains: [],
     ptr: null, ptrUnsupported: false,
+    // Phase 2 fields, populated by runNewPanels().
+    hasVT: false, hasShodan: false, hasOTX: false, hasThreatFox: false, hasUrlscanKey: false, hasCensys: false,
+    resolvedIp: null,
+    vtGeneral: undefined, vtResolutions: undefined, otxGeneral: undefined, otxPdns: undefined, threatfox: undefined,
+    shodanHost: undefined, censysHost: undefined, ipinfoData: undefined, robtexPdns: [], hackertargetReverse: [],
+    headerProbe: null,
+    urlscanResult: null, urlscanFresh: false, urlscanPolling: false, urlscanNoKey: false,
+    urlscanSubmitFailed: false, urlscanTimedOut: false, urlscanUuid: null,
+    lookalikeResults: [],
   };
 
   let stepsDone = 0;
@@ -78,6 +97,7 @@ async function runScan(target, type) {
       ]);
       state.a = dohList(aRes, 1);
       state.aaaa = dohList(aaaaRes, 28);
+      const resolvedIp = state.a.length ? state.a[0] : null;
 
       const asnPromise = (async () => {
         if (!state.a.length) {
@@ -171,7 +191,9 @@ async function runScan(target, type) {
         stepDone('Subdomains');
       });
 
-      await Promise.all([asnPromise, rdapPromise, dnsPromise, emailPromise, certsPromise, subdomainsPromise]);
+      const newPanelsPromise = runNewPanels(state, resolvedIp, asnPromise, signal, stepDone);
+
+      await Promise.all([asnPromise, rdapPromise, dnsPromise, emailPromise, certsPromise, subdomainsPromise, newPanelsPromise]);
     } else {
       // type === 'ip'
       const rdapPromise = fetchRDAP(target, 'ip', signal).then(r => {
@@ -217,7 +239,9 @@ async function runScan(target, type) {
       renderCerts(state); stepDone('Certificates · CT Logs');
       renderSubdomains(state); stepDone('Subdomains');
 
-      await Promise.all([rdapPromise, asnPromise, dnsPromise]);
+      const newPanelsPromise = runNewPanels(state, target, asnPromise, signal, stepDone);
+
+      await Promise.all([rdapPromise, asnPromise, dnsPromise, newPanelsPromise]);
     }
 
     if (!scanAborted) {
@@ -242,4 +266,248 @@ async function runScan(target, type) {
 function dohList(res, wantType) {
   if (!res || !Array.isArray(res.Answer)) return [];
   return res.Answer.filter(a => a.type === wantType).map(a => a.data);
+}
+
+/* ══ Phase 2: the 9 BYOK/relay panels ═══════════════════════════════════════
+   ip is the already-resolved IP to use for IP-keyed sources (Shodan, Censys,
+   ipinfo, HackerTarget reverseiplookup): for a domain target this is the
+   first A record from the free DNS step, for an IP target it's the target
+   itself. asnPromise is awaited before rendering the Cloud panel so it can
+   read the same RIPE holder data the free ASN panel already fetched, no
+   second RIPE fetch. */
+async function runNewPanels(state, ip, asnPromise, signal, stepDone) {
+  const hasVT = !!getKey('vt');
+  const hasShodan = !!getKey('shodan');
+  const hasOTX = !!getKey('otx');
+  const hasThreatFox = !!getKey('threatfox');
+  const hasUrlscanKey = !!getKey('urlscan');
+  const censysKey = getKey('censys');
+  const hasCensys = !!censysKey;
+
+  state.hasVT = hasVT;
+  state.hasShodan = hasShodan;
+  state.hasOTX = hasOTX;
+  state.hasThreatFox = hasThreatFox;
+  state.hasUrlscanKey = hasUrlscanKey;
+  state.hasCensys = hasCensys;
+  state.resolvedIp = ip;
+
+  const otxType = state.type === 'ip' ? 'IPv4' : 'domain';
+  const vtPathBase = state.type === 'ip' ? `ip_addresses/${state.target}` : `domains/${state.target}`;
+  const vtResPath = state.type === 'ip' ? `ip_addresses/${state.target}/resolutions` : `domains/${state.target}/resolutions`;
+
+  const tiPromise = (async () => {
+    const [vt, otx, tf] = await Promise.all([
+      hasVT ? fetchVT(vtPathBase, getKey('vt'), signal) : Promise.resolve(undefined),
+      hasOTX ? fetchOTXGeneral(state.target, otxType, getKey('otx'), signal) : Promise.resolve(undefined),
+      hasThreatFox ? fetchThreatFox(state.target, getKey('threatfox'), signal) : Promise.resolve(undefined),
+    ]);
+    if (scanAborted) return;
+    state.vtGeneral = vt;
+    state.otxGeneral = otx;
+    state.threatfox = tf;
+    renderThreatIntel(state);
+    stepDone('Threat Intelligence');
+  })();
+
+  const pdnsPromise = (async () => {
+    const [vtRes, otxPdns, robtex] = await Promise.all([
+      hasVT ? fetchVT(vtResPath, getKey('vt'), signal) : Promise.resolve(undefined),
+      hasOTX ? fetchOTXPassiveDNS(state.target, otxType, getKey('otx'), signal) : Promise.resolve(undefined),
+      state.type === 'domain' ? fetchRobtexPDNS(state.target, signal) : Promise.resolve([]),
+    ]);
+    if (scanAborted) return;
+    state.vtResolutions = vtRes;
+    state.otxPdns = otxPdns;
+    state.robtexPdns = robtex;
+    renderPassiveDNS(state);
+    stepDone('Passive DNS');
+  })();
+
+  // Shared Shodan host lookup, one fetch feeding Co-hosted/Ports/Fingerprints/Cloud.
+  const shodanPromise = (async () => {
+    if (!ip || !hasShodan) return;
+    state.shodanHost = await fetchShodanHost(ip, getKey('shodan'), signal);
+  })();
+
+  const censysPromise = (async () => {
+    if (!ip || !hasCensys) return;
+    state.censysHost = await fetchCensysHost(ip, censysKey, signal);
+  })();
+
+  const ipinfoPromise = (async () => {
+    if (!ip) return;
+    state.ipinfoData = await fetchIpinfo(ip, getKey('ipinfo'), signal);
+  })();
+
+  const cohostedPromise = (async () => {
+    const [ht] = await Promise.all([
+      ip ? fetchHackerTargetReverseIP(ip, signal) : Promise.resolve([]),
+      shodanPromise,
+    ]);
+    if (scanAborted) return;
+    state.hackertargetReverse = ht;
+    renderCohosted(state, ip);
+    stepDone('Co-hosted Infra');
+  })();
+
+  const portsPromise = shodanPromise.then(() => {
+    if (scanAborted) return;
+    renderPorts(state, ip);
+    stepDone('Ports · Services');
+  });
+
+  const fpPromise = shodanPromise.then(() => {
+    if (scanAborted) return;
+    renderFingerprints(state, ip);
+    stepDone('Fingerprints · JARM · Favicon');
+  });
+
+  const cloudPromise = (async () => {
+    await Promise.all([shodanPromise, censysPromise, ipinfoPromise, asnPromise]);
+    if (scanAborted) return;
+    renderCloudHosting(state, ip);
+    stepDone('Cloud · Hosting Provider');
+  })();
+
+  const cdnwafPromise = (async () => {
+    state.headerProbe = await fetchHeaderProbe(state.target, signal);
+    if (scanAborted) return;
+    renderCdnWaf(state);
+    stepDone('CDN · WAF Detection');
+  })();
+
+  const urlscanPromise = (async () => {
+    const search = await fetchUrlscanSearch(state.target, signal);
+    if (scanAborted) return;
+    const existing = search && Array.isArray(search.results) && search.results.length ? search.results[0] : null;
+
+    if (existing) {
+      state.urlscanResult = existing;
+      state.urlscanFresh = false;
+      renderUrlscan(state);
+      stepDone('URLScan · Screenshot');
+      return;
+    }
+    if (!hasUrlscanKey) {
+      state.urlscanNoKey = true;
+      renderUrlscan(state);
+      stepDone('URLScan · Screenshot');
+      return;
+    }
+
+    state.urlscanPolling = true;
+    renderUrlscan(state);
+    const submit = await submitUrlscan(state.target, getKey('urlscan'), signal);
+    if (scanAborted) return;
+    if (!submit || submit.error || !submit.uuid) {
+      state.urlscanPolling = false;
+      state.urlscanSubmitFailed = true;
+      renderUrlscan(state);
+      stepDone('URLScan · Screenshot');
+      return;
+    }
+    state.urlscanUuid = submit.uuid;
+    const result = await pollUrlscanResult(submit.uuid, signal);
+    if (scanAborted) return;
+    state.urlscanPolling = false;
+    if (result) {
+      state.urlscanResult = result;
+      state.urlscanFresh = true;
+    } else {
+      state.urlscanTimedOut = true;
+    }
+    renderUrlscan(state);
+    stepDone('URLScan · Screenshot');
+  })();
+
+  const lookalikePromise = (async () => {
+    if (state.type !== 'domain') {
+      renderLookalike(state);
+      stepDone('Lookalike · Permutations');
+      return;
+    }
+    const candidates = generateLookalikeCandidates(state.target);
+    const resolved = await checkLookalikeCandidates(candidates, signal);
+    if (scanAborted) return;
+    state.lookalikeResults = resolved;
+    renderLookalike(state);
+    stepDone('Lookalike · Permutations');
+  })();
+
+  await Promise.all([
+    tiPromise, pdnsPromise, cohostedPromise, portsPromise, fpPromise,
+    cloudPromise, cdnwafPromise, urlscanPromise, lookalikePromise,
+  ]);
+}
+
+/* ── Lookalike / permutation generation, pure client-side, no key/relay ─────
+   Splits the target into label + rest (e.g. "cloudflare" + ".com") and
+   generates candidates via a handful of cheap typosquat strategies, capped
+   and sampled down to stay responsive since every candidate costs a DoH
+   round-trip. */
+function splitRegistrableDomain(target) {
+  const idx = target.indexOf('.');
+  if (idx === -1) return { label: target, rest: '' };
+  return { label: target.slice(0, idx), rest: target.slice(idx) };
+}
+
+function generateLookalikeCandidates(target) {
+  const { label, rest } = splitRegistrableDomain(target);
+  if (!label || !rest) return [];
+  const candidates = new Set();
+
+  for (let i = 0; i < label.length; i++) {
+    candidates.add(label.slice(0, i) + label.slice(i + 1) + rest);
+  }
+  for (let i = 0; i < label.length; i++) {
+    candidates.add(label.slice(0, i + 1) + label[i] + label.slice(i + 1) + rest);
+  }
+  for (let i = 0; i < label.length - 1; i++) {
+    const chars = label.split('');
+    const tmp = chars[i]; chars[i] = chars[i + 1]; chars[i + 1] = tmp;
+    candidates.add(chars.join('') + rest);
+  }
+  for (let i = 0; i < label.length; i++) {
+    const sub = HOMOGLYPH_MAP[label[i]];
+    if (sub) candidates.add(label.slice(0, i) + sub + label.slice(i + 1) + rest);
+  }
+  for (let i = 1; i < label.length; i++) {
+    candidates.add(label.slice(0, i) + '-' + label.slice(i) + rest);
+  }
+  const restBare = rest.replace(/^\./, '');
+  if (LOOKALIKE_TLD_SWAP_SET.includes(restBare)) {
+    LOOKALIKE_TLD_SWAP_SET.forEach(tld => {
+      if (tld !== restBare) candidates.add(label + '.' + tld);
+    });
+  }
+
+  candidates.delete(target);
+  let list = Array.from(candidates);
+  if (list.length > LOOKALIKE_CAP) {
+    for (let i = list.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = list[i]; list[i] = list[j]; list[j] = tmp;
+    }
+    list = list.slice(0, LOOKALIKE_CAP);
+  }
+  return list;
+}
+
+async function checkLookalikeCandidates(candidates, signal) {
+  const results = [];
+  for (let i = 0; i < candidates.length; i += LOOKALIKE_BATCH) {
+    if (scanAborted) break;
+    const batch = candidates.slice(i, i + LOOKALIKE_BATCH);
+    const batchResults = await Promise.all(batch.map(async name => {
+      const res = await fetchDoH(name, 'A', signal);
+      if (res && Array.isArray(res.Answer) && res.Answer.length) {
+        const aRecord = res.Answer.find(a => a.type === 1) || res.Answer[0];
+        return { domain: name, ip: aRecord.data };
+      }
+      return null;
+    }));
+    batchResults.forEach(r => { if (r) results.push(r); });
+  }
+  return results;
 }
