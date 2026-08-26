@@ -348,6 +348,7 @@ body.light .btn-primary{color:#fff;box-shadow:0 0 18px rgba(10,110,168,.25);}
 .footer-credit-pill .credit-tool{font-weight:700;letter-spacing:2px;}
 .footer-credit-pill .credit-by{color:var(--muted);}
 .footer-credit-pill .credit-name{color:var(--accent);font-weight:700;letter-spacing:.5px;}
+.footer-copyright{color:var(--muted);font-family:'Exo 2',sans-serif;font-size:var(--fs-xs);}
 
 /* ── Responsive ─────────────────────────────────────────────────────────── */
 body.nav-compact .nav-links{display:none;}
