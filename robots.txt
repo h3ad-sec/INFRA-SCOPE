@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://h3ad-sec.github.io/INFRA-SCOPE/sitemap.xml
